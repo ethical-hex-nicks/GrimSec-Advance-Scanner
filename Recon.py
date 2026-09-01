@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, ssl, time, re, json, socket, random, threading, warnings
+import os, sys, ssl, time, re, json, socket, random, threading, warnings, argparse
 from datetime import datetime
 from urllib.parse import urlparse, urljoin, parse_qs
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,6 +10,13 @@ try:
     HAS_DNS = True
 except ImportError:
     HAS_DNS = False
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
 
 BANNER = """
 \033[91m
@@ -45,6 +52,7 @@ TIMEOUT = 8
 CONNECT_TIMEOUT = 4
 OUTPUT_DIR = "grimsec_results"
 MAGICPATH_FILE = "utils/magicpath.txt"
+DELAY = 0  # seconds between requests
 
 class Colors:
     RED = '\033[91m'
@@ -281,14 +289,20 @@ SQLI_PAYLOADS = [
 ]
 
 class HTTPClient:
-    def __init__(self):
+    def __init__(self, cookies=None, headers=None, delay=0):
         self.session = requests.Session()
         self.session.verify = False
         self.session.max_redirects = 5
         self.session.headers.update({"Connection": "keep-alive"})
+        if cookies:
+            self.session.cookies.update(cookies)
+        if headers:
+            self.session.headers.update(headers)
+        self.delay = delay
         adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=2)
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
+        self.rate_lock = threading.Lock()
     def get_headers(self):
         return {
             "User-Agent": random.choice(USER_AGENTS),
@@ -303,6 +317,9 @@ class HTTPClient:
             headers["Referer"] = referer
         for attempt in range(retries + 1):
             try:
+                if self.delay > 0:
+                    with self.rate_lock:
+                        time.sleep(self.delay)
                 return self.session.get(url, headers=headers, timeout=(CONNECT_TIMEOUT, TIMEOUT), allow_redirects=True)
             except requests.exceptions.SSLError:
                 try:
@@ -316,6 +333,9 @@ class HTTPClient:
         return None
     def post(self, url, data=None):
         try:
+            if self.delay > 0:
+                with self.rate_lock:
+                    time.sleep(self.delay)
             return self.session.post(url, data=data, headers=self.get_headers(), timeout=(CONNECT_TIMEOUT, TIMEOUT), allow_redirects=True)
         except:
             return None
@@ -867,21 +887,59 @@ class TechnologyDetector:
         return self.technologies
 
 class VulnerabilityScanner:
-    def __init__(self, target_url, client):
+    def __init__(self, target_url, client, use_selenium=False):
         self.target = target_url
         self.client = client
         self.vulnerabilities = []
         self.scanned_urls = set()
+        self.use_selenium = use_selenium and SELENIUM_AVAILABLE
+        if self.use_selenium:
+            self.driver = self._create_driver()
+        else:
+            self.driver = None
+    def _create_driver(self):
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--window-size=1920,1080")
+        chrome_options.add_argument("--ignore-certificate-errors")
+        try:
+            return webdriver.Chrome(options=chrome_options)
+        except:
+            return None
+    def _get_page_content(self, url):
+        if self.driver:
+            try:
+                self.driver.get(url)
+                time.sleep(2)
+                return self.driver.page_source
+            except:
+                return None
+        return None
     def test_xss(self, url, param=None, method="GET"):
         for payload in XSS_PAYLOADS:
             try:
                 if method == "GET":
                     test_url = f"{url}?{param}={requests.utils.quote(payload)}" if param else f"{url}?q={requests.utils.quote(payload)}"
                     resp = self.client.get(test_url)
+                    if self.use_selenium and resp:
+                        page = self._get_page_content(test_url)
+                        if page and payload in page:
+                            self.vulnerabilities.append({"type":"XSS","url":url,"parameter":param or "N/A","payload":payload,"method":method,"severity":"HIGH"})
+                            log_found(f"XSS: {url} [{param or 'N/A'}] ({method})")
+                            return
                 else:
                     test_url = url
                     data = {param: payload} if param else {"q": payload}
                     resp = self.client.post(test_url, data=data)
+                    if self.use_selenium and resp:
+                        page = self._get_page_content(test_url)
+                        if page and payload in page:
+                            self.vulnerabilities.append({"type":"XSS","url":url,"parameter":param or "N/A","payload":payload,"method":method,"severity":"HIGH"})
+                            log_found(f"XSS: {url} [{param or 'N/A'}] ({method})")
+                            return
                 if resp and payload in (resp.text or '')[:80000]:
                     self.vulnerabilities.append({"type":"XSS","url":url,"parameter":param or "N/A","payload":payload,"method":method,"severity":"HIGH"})
                     log_found(f"XSS: {url} [{param or 'N/A'}] ({method})")
@@ -1038,6 +1096,8 @@ class VulnerabilityScanner:
                 self.test_sqli(form['action'], input_name, form['method'])
                 self.test_lfi(form['action'], input_name)
                 self.test_open_redirect(form['action'], input_name)
+        if self.driver:
+            self.driver.quit()
         save_result("vulnerability_scan_results.json", self.vulnerabilities)
         severity_count = {}
         for v in self.vulnerabilities:
@@ -1378,12 +1438,13 @@ class SecurityHeaders:
         return results
 
 class ReconEngine:
-    def __init__(self, url):
+    def __init__(self, url, cookies=None, headers=None, delay=0, use_selenium=False):
         self.original_url = url
         self.target = parse_base_url(url)
         self.domain = extract_domain(url)
-        self.client = HTTPClient()
+        self.client = HTTPClient(cookies=cookies, headers=headers, delay=delay)
         self.results = {}
+        self.use_selenium = use_selenium
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         if self.original_url != self.target:
             log_info(f"URL Parsed: {self.original_url} -> {self.target}")
@@ -1395,7 +1456,7 @@ class ReconEngine:
             log_info(f"Target IP: {ip}")
         except:
             ip = "N/A"
-        log_info(f"Threads: {THREADS} | Timeout: {TIMEOUT}s")
+        log_info(f"Threads: {THREADS} | Timeout: {TIMEOUT}s | Delay: {self.client.delay}s")
         print()
         tech = TechnologyDetector(self.target, self.client)
         self.results['technologies'] = tech.detect() or {}
@@ -1415,7 +1476,7 @@ class ReconEngine:
         portscanner = PortScanner(self.domain)
         self.results['ports'] = portscanner.scan() or []
         print()
-        vuln_scanner = VulnerabilityScanner(self.target, self.client)
+        vuln_scanner = VulnerabilityScanner(self.target, self.client, use_selenium=self.use_selenium)
         self.results['vulnerabilities'] = vuln_scanner.scan() or []
         print()
         email_finder = EmailFinder(self.target, self.client)
@@ -1469,13 +1530,28 @@ IP:           {ip}
                     print(f"      Parameter: {v['parameter']}")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='GrimSec Philippines Advance Recon')
+    parser.add_argument('url', help='Target URL (e.g., https://example.com)')
+    parser.add_argument('--cookies', help='Cookie string (e.g., "session=abc; token=xyz")', default=None)
+    parser.add_argument('--headers', help='Custom headers as JSON string (e.g., \'{"Authorization":"Bearer token"}\')', default=None)
+    parser.add_argument('--delay', type=float, default=0, help='Delay between requests in seconds (rate limiting)')
+    parser.add_argument('--selenium', action='store_true', help='Enable Selenium for JS-heavy pages (requires selenium and chromedriver)')
+    args = parser.parse_args()
     print(BANNER)
-    if len(sys.argv) < 2:
-        print(f"Usage: python3 {sys.argv[0]} <url>")
-        print(f"Example: python3 {sys.argv[0]} https://target.com")
-        sys.exit(1)
-    url = sys.argv[1]
+    url = args.url
     if not url.startswith(('http://','https://')):
         url = 'https://' + url
-    engine = ReconEngine(url)
+    cookies = {}
+    if args.cookies:
+        for pair in args.cookies.split(';'):
+            if '=' in pair:
+                k, v = pair.strip().split('=', 1)
+                cookies[k] = v
+    headers = {}
+    if args.headers:
+        try:
+            headers = json.loads(args.headers)
+        except:
+            log_warn("Invalid headers JSON, ignoring.")
+    engine = ReconEngine(url, cookies=cookies, headers=headers, delay=args.delay, use_selenium=args.selenium)
     engine.run_all()
